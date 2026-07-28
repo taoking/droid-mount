@@ -15,3 +15,5 @@
 - [ ] 待当前 macOS 内核中挂起的旧 `umount` 清理后，再补一次实际菜单卸载与重连验证。
 - [x] 创建公开 GitHub 仓库 `taoking/droid-mount` 并推送代码。
 - [x] 构建 `v0.1.0` arm64 发布包并上传到 GitHub Releases。
+- [x] 生成并接入 DroidMount 应用图标（透明 PNG 与 macOS `.icns`）。
+- [x] 构建并发布包含新图标的 `v0.1.1` arm64 安装包。

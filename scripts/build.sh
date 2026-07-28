@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_NAME="DroidMount"
 APP_BUNDLE="$PROJECT_ROOT/$APP_NAME.app"
+ICON_SOURCE="$PROJECT_ROOT/Resources/DroidMount.icns"
 BUILD_MODE="debug"
 TARGET_ARCH="$(uname -m)"
 
@@ -47,12 +48,18 @@ if [[ ! -x "$SWIFT_BIN" ]]; then
     exit 1
 fi
 
+if [[ ! -f "$ICON_SOURCE" ]]; then
+    echo "ERROR: App icon was not found at $ICON_SOURCE" >&2
+    exit 1
+fi
+
 HELPER_PATH="$("$PROJECT_ROOT/scripts/build_finder_mount.sh" "$TARGET_ARCH")"
 
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/FinderMount"
 cp "$SWIFT_BIN" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 cp "$PROJECT_ROOT/Resources/Info.plist" "$APP_BUNDLE/Contents/Info.plist"
+cp "$ICON_SOURCE" "$APP_BUNDLE/Contents/Resources/DroidMount.icns"
 cp "$HELPER_PATH" "$APP_BUNDLE/Contents/Resources/FinderMount/aft-mtp-mount"
 chmod 755 "$APP_BUNDLE/Contents/Resources/FinderMount/aft-mtp-mount"
 printf 'APPL????' > "$APP_BUNDLE/Contents/PkgInfo"
