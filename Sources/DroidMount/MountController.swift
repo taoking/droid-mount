@@ -92,6 +92,16 @@ final class MountController: NSObject {
 
         let baseDirectory = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let configuration = MountConfiguration.make(baseDirectory: baseDirectory)
+
+        // A previous app instance can leave a FUSE mount behind after its helper
+        // exits. Treat that mount as an existing volume instead of spawning a
+        // new helper and repeatedly asking Finder to open the same path.
+        guard !isMountPoint(configuration.mountPoint) else {
+            activeConfiguration = configuration
+            state = .mounted(configuration.mountPoint)
+            return
+        }
+
         state = .mounting
 
         do {
@@ -121,7 +131,6 @@ final class MountController: NSObject {
             }
 
             state = .mounted(configuration.mountPoint)
-            NSWorkspace.shared.open(configuration.mountPoint)
         } catch {
             cleanUpAfterFailure()
             state = stateFor(error: error)

@@ -17,3 +17,5 @@
 - [x] 构建 `v0.1.0` arm64 发布包并上传到 GitHub Releases。
 - [x] 生成并接入 DroidMount 应用图标（透明 PNG 与 macOS `.icns`）。
 - [x] 构建并发布包含新图标的 `v0.1.1` arm64 安装包。
+- [x] 修复遗留 FUSE 挂载被重试循环误判为成功、反复唤起 Finder 的问题；Finder 打开改为显式菜单操作。
+- [x] 构建并发布包含弹窗修复的 `v0.1.2` arm64 安装包。
