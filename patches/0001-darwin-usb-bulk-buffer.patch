@@ -1,0 +1,112 @@
+Batch darwin USB bulk transfers instead of moving one packet per IOKit call.
+
+IOUSBInterfaceInterface::ReadPipe/WritePipe are synchronous, so the previous
+buffer of exactly one wMaxPacketSize (512 bytes on high speed) meant one
+user/kernel round trip and one USB turnaround for every 512 bytes on the wire.
+The linux backend already batches into whole-packet multiples per URB, and both
+libmtp (CONTEXT_BLOCK_SIZE) and go-mtpfs (rwBufSize) use 16 KiB. Measured on a
+Xiaomi 17 Pro copying 100 JPEGs out of DCIM: 5.1 MiB/s at one packet per call,
+21.5-23.0 MiB/s at 16 KiB, 24.6 at 64 KiB, 25.9 at 256 KiB. Default to 256 KiB;
+AFTL_USB_BULK_BUFFER_SIZE overrides it for measurement.
+
+The write path needs one extra guarantee: the old loop always ended on a read
+shorter than a single packet, which framed the transfer's end for the device.
+A batched buffer can end its final partial read on a packet boundary, so send
+an explicit zero-length packet in that case.
+
+--- a/mtp/backend/darwin/usb/Device.cpp	2026-09-13 01:06:47
++++ b/mtp/backend/darwin/usb/Device.cpp	2026-09-13 01:06:47
+@@ -24,9 +24,50 @@
+ #include <mtp/ByteArray.h>
+ #include <mtp/log.h>
+ 
++#include <algorithm>
++#include <cstdlib>
++#include <stdexcept>
++
+ namespace mtp { namespace usb
+ {
+ 
++	namespace
++	{
++		//! IOKit's ReadPipe/WritePipe are synchronous: every call costs a user/kernel
++		//! round trip plus a USB turnaround. Moving a single max-size packet (512 bytes
++		//! on high speed, 1024 on super speed) per call is what makes this backend much
++		//! slower than the linux one, which batches whole-packet multiples into one URB.
++		//! 16 KiB is the block size libmtp and go-mtpfs settled on and is already
++		//! ~4x faster than one packet per call; 256 KiB measured a further ~20% on a
++		//! Xiaomi 17 Pro, so start there.
++		constexpr size_t DefaultBulkBufferSize	= 256 * 1024;
++		constexpr size_t MaxBulkBufferSize		= 1024 * 1024;
++
++		size_t GetBulkBufferSize(const EndpointPtr & ep)
++		{
++			int maxPacketSize = ep->GetMaxPacketSize();
++			if (maxPacketSize <= 0)
++				throw std::runtime_error("endpoint reported invalid max packet size");
++			size_t packetSize = maxPacketSize;
++
++			size_t requested = DefaultBulkBufferSize;
++			const char * tuning = getenv("AFTL_USB_BULK_BUFFER_SIZE");
++			if (tuning && *tuning)
++			{
++				char * end = nullptr;
++				unsigned long value = strtoul(tuning, &end, 0);
++				if (end && *end == 0 && value > 0)
++					requested = value;
++				else
++					error("ignoring malformed AFTL_USB_BULK_BUFFER_SIZE=", tuning);
++			}
++			requested = std::min(requested, MaxBulkBufferSize);
++
++			//! bulk transfers must be a whole number of max-size packets
++			return std::max(packetSize, requested / packetSize * packetSize);
++		}
++	}
++
+ 	Device::Device(ContextPtr context, IOUSBDeviceType ** dev): _context(context), _dev(dev)
+ 	{ }
+ 
+@@ -54,7 +95,8 @@
+ 	{
+ 		IOUSBInterfaceInterface	** interface = ep->GetInterfaceHandle();
+ 
+-		size_t transferSize = ep->GetMaxPacketSize();
++		size_t packetSize = ep->GetMaxPacketSize();
++		size_t transferSize = GetBulkBufferSize(ep);
+ 		ByteArray buffer(transferSize);
+ 		size_t r;
+ 		do
+@@ -63,12 +105,19 @@
+ 			USB_CALL((*interface)->WritePipe(interface, ep->GetRefIndex(), buffer.data(), r));
+ 		}
+ 		while(r == transferSize);
++
++		//! The transfer has to end on a packet shorter than the endpoint's max packet
++		//! size. A single-packet buffer got that for free from the final short read;
++		//! a batched buffer can end its final partial read on a packet boundary, so
++		//! close the transfer explicitly.
++		if (r != 0 && r % packetSize == 0)
++			USB_CALL((*interface)->WritePipe(interface, ep->GetRefIndex(), buffer.data(), 0));
+ 	}
+ 
+ 	void Device::ReadBulk(const EndpointPtr & ep, const IObjectOutputStreamPtr &outputStream, int timeout)
+ 	{
+ 		IOUSBInterfaceInterface	** interface = ep->GetInterfaceHandle();
+-		size_t transferSize = ep->GetMaxPacketSize();
++		size_t transferSize = GetBulkBufferSize(ep);
+ 		ByteArray buffer(transferSize);
+ 		size_t r;
+ 		do
+@@ -76,6 +125,11 @@
+ 			UInt32 readBytes = buffer.size();
+ 			USB_CALL((*interface)->ReadPipe(interface, ep->GetRefIndex(), buffer.data(), &readBytes));
+ 			r = outputStream->Write(buffer.data(), readBytes);
++			//! The pipe stops at the container's short packet, so the stream should take
++			//! everything. If it ever does not, the tail belongs to the next container
++			//! and has just been lost - worth seeing under -d.
++			if (r != readBytes)
++				debug("bulk read of ", readBytes, " bytes, stream consumed ", r);
+ 		}
+ 		while(r == transferSize);
+ 	}

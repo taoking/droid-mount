@@ -19,3 +19,8 @@
 - [x] 构建并发布包含新图标的 `v0.1.1` arm64 安装包。
 - [x] 修复遗留 FUSE 挂载被重试循环误判为成功、反复唤起 Finder 的问题；Finder 打开改为显式菜单操作。
 - [x] 构建并发布包含弹窗修复的 `v0.1.2` arm64 安装包。
+- [x] 将 macOS USB 后端单次批量传输由「一个 USB 包」提升到 16 KiB（`patches/0001-darwin-usb-bulk-buffer.patch`），并把上游源码改为补丁化暂存构建。
+- [x] 在小米 17 Pro 上实测拷贝速度：`DCIM/101MSDCF` 的 100 张 JPG，打补丁前 5.14 MiB/s，打补丁后 21.5–23.0 MiB/s（4.2×）；15 个文件跨两条代码路径 SHA-256 一致，900 个拷贝件 JPEG 首尾标记完整。
+- [x] 把默认缓冲提到 256 KiB，并为挂载参数加上 `-o iosize=1048576 -o noappledouble`（实测组合 31.6–32.3 MiB/s）。
+- [x] 修复 `scripts/build.sh` 把 7 月 28 日的陈旧二进制打进 app bundle 的问题：产物路径改为向 SwiftPM 查询 `--show-bin-path`，并新增 `lipo -archs` 架构校验（当前工具链的输出目录不再按 triple 区分）。
+- [ ] 待手机重新连接后，用新默认值复跑 100 张 JPG 拷贝，确认落在 31–32 MiB/s。

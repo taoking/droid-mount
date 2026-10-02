@@ -43,9 +43,39 @@ open DroidMount.app
 
 构建脚本会编译并打包 `aft-mtp-mount`。DroidMount 不包含云服务、账号、遥测或钥匙串凭证。
 
+`android-file-transfer-linux` 保持上游原样，不做任何本地修改。构建时会先把它同步到 `.build/aft-src-<架构>/`，再按顺序套用 `patches/*.patch`，然后从该副本编译。新增改动请写成 `patches/` 下的补丁文件。
+
+### 传输性能
+
+拷贝速度由两处配置共同决定，二者独立生效：
+
+1. **USB 批量传输缓冲**。`patches/0001-darwin-usb-bulk-buffer.patch` 把 macOS USB 后端的单次批量传输从「一个 USB 包」（高速 512 字节 / 超速 1024 字节）提升到 256 KiB。IOKit 的 `ReadPipe`/`WritePipe` 是同步调用，每次调用都要付一次用户态/内核态往返加一次 USB 往返，因此调用次数直接决定吞吐。
+2. **FUSE 请求大小**。`MountConfiguration` 传入 `-o iosize=1048576` 和 `-o noappledouble`：每个 FUSE 读请求对应一次 MTP 事务，请求越大往返越少；`noappledouble` 则避免 Finder 为每个文件额外写入 `._` 附属文件。
+
+在小米 17 Pro 上从 DCIM 拷贝 100 张 JPEG 的实测（每组文件互不重叠，每次测量前重新挂载）：
+
+| 配置 | 吞吐 |
+|---|---|
+| 每次调用一个 USB 包（打补丁前） | 5.1 MiB/s |
+| 16 KiB | 21.5–23.0 MiB/s |
+| 64 KiB | 24.6 MiB/s |
+| 256 KiB | 25.9 MiB/s |
+| 16 KiB + `iosize=1M` | 28.2 MiB/s |
+| 256 KiB + `iosize=1M` + `noappledouble`（当前默认） | 31.6–32.3 MiB/s |
+
+缓冲大小可用环境变量在运行时调整，便于在真机上对比，不必重新构建：
+
+```bash
+# 复现打补丁前的行为（每次调用一个 USB 包）
+AFTL_USB_BULK_BUFFER_SIZE=1 ./aft-mtp-mount /path/to/mountpoint
+
+# 试其他缓冲，上限 1 MiB；实际值会向下取整到 USB 包大小的整数倍
+AFTL_USB_BULK_BUFFER_SIZE=65536 ./aft-mtp-mount /path/to/mountpoint
+```
+
 ## 已知行为
 
-- Finder 的 macOS 元数据可能作为 `._` 前缀的普通文件写入手机存储。
+- 挂载时已传入 `noappledouble`，Finder 不会再为每个文件写入 `._` 前缀的附属文件；`.DS_Store` 等其他元数据文件仍可能出现。
 - 卸载前请停止正在进行的拷贝并关闭占用该卷的文件；DroidMount 会保持菜单栏可响应，并在卸载失败时提示处理方式。
 - 物理拔线时，先重新插入、解锁并重新选择“文件传输 / MTP”；DroidMount 会自动重新尝试挂载。
 - 应用不提供多设备选择器；连接多台设备时，挂载助手会使用第一台可用 MTP 设备。
