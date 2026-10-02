@@ -1,279 +1,291 @@
 import AppKit
-import Darwin
 import Foundation
 
-enum MountState: Equatable {
-    case waitingForAndroid
-    case mounting
-    case mounted(URL)
-    case unavailable(String)
-    case failed(String)
-
-    var statusText: String {
-        switch self {
-        case .waitingForAndroid:
-            return "等待 Android MTP 设备"
-        case .mounting:
-            return "正在挂载 Android…"
-        case .mounted:
-            return "Android 已挂载到 Finder"
-        case .unavailable(let message), .failed(let message):
-            return message
-        }
-    }
-
-    var isMounted: Bool {
-        if case .mounted = self { return true }
-        return false
-    }
-}
-
+/// Carries out the mount lifecycle: watches for MTP phones, starts and stops aft-mtp-mount,
+/// and clears away whatever a helper leaves mounted when it dies.
 @MainActor
-final class MountController: NSObject {
+final class MountController {
     static let macFUSEFileSystemURL = URL(fileURLWithPath: "/Library/Filesystems/macfuse.fs", isDirectory: true)
     static let macFUSELibraryURL = URL(fileURLWithPath: "/usr/local/lib/libfuse3.4.dylib")
 
-    private(set) var state: MountState {
-        didSet { onStateChange?(state) }
-    }
-    var onStateChange: ((MountState) -> Void)?
+    /// A phone that answers mounts in well under a second; a slow one still gets time to
+    /// open its MTP session.
+    private static let mountTimeout: Duration = .seconds(15)
+    /// How long a helper may linger after its volume was unmounted before it is stopped.
+    private static let helperExitGrace: Duration = .seconds(3)
 
-    private let fileManager: FileManager
-    private var usbMonitor: USBDeviceMonitor?
+    private(set) var lifecycle = MountLifecycle()
+    private(set) var unavailableReason: String?
+    var onStateChange: (() -> Void)?
+
+    let mountPoint: URL
+    private let baseDirectory: URL
+    private var monitor: USBDeviceMonitor?
+    private var devices: [MTPDevice] = []
+    /// The phone the running helper was started for.
+    private var activeDevice: MTPDevice?
+    private var helper: HelperProcess?
     private var retryTimer: Timer?
-    private var mountProcess: Process?
-    private var pendingUnmountProcess: Process?
-    private var outputPipe: Pipe?
-    private var activeConfiguration: MountConfiguration?
+    /// Bumped whenever a mount attempt is abandoned, so its pending steps stand down.
+    private var attempt = 0
 
-    override init() {
-        fileManager = .default
-        state = .waitingForAndroid
-        super.init()
-        if let reason = unavailableReason() {
-            state = .unavailable(reason)
-        }
+    init() {
+        baseDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        mountPoint = MountConfiguration.mountPoint(baseDirectory: baseDirectory)
+        unavailableReason = Self.checkAvailability()
+    }
+
+    var statusText: String {
+        unavailableReason ?? lifecycle.statusText
     }
 
     func start() {
-        guard unavailableReason() == nil else {
-            state = .unavailable(unavailableReason() ?? "Finder 挂载不可用。")
-            return
+        if unavailableReason == nil {
+            startMonitoring()
         }
-
-        usbMonitor = USBDeviceMonitor { [weak self] in
-            self?.mountIfNeeded()
-        }
-        usbMonitor?.start()
-        retryTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.mountIfNeeded()
-            }
-        }
-        mountIfNeeded()
+        onStateChange?()
     }
 
-    func stop() {
-        retryTimer?.invalidate()
-        retryTimer = nil
-        usbMonitor?.stop()
-        usbMonitor = nil
-        unmountSynchronously()
+    /// macFUSE can be installed or approved while DroidMount runs; checked when the menu opens.
+    func refreshAvailability() {
+        let reason = Self.checkAvailability()
+        guard reason != unavailableReason else { return }
+        unavailableReason = reason
+        if reason == nil {
+            startMonitoring()
+        }
+        onStateChange?()
     }
 
-    func mountIfNeeded() {
-        guard !state.isMounted, state != .mounting, unavailableReason() == nil else { return }
-        Task { await mount() }
+    func mountNow() {
+        send(.mountRequested)
     }
 
-    func mount() async {
-        guard !state.isMounted, state != .mounting,
-              let helperURL = bundledHelperURL(), unavailableReason() == nil else { return }
-
-        let baseDirectory = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let configuration = MountConfiguration.make(baseDirectory: baseDirectory)
-
-        // A previous app instance can leave a FUSE mount behind after its helper
-        // exits. Treat that mount as an existing volume instead of spawning a
-        // new helper and repeatedly asking Finder to open the same path.
-        guard !isMountPoint(configuration.mountPoint) else {
-            activeConfiguration = configuration
-            state = .mounted(configuration.mountPoint)
-            return
-        }
-
-        state = .mounting
-
-        do {
-            try fileManager.createDirectory(at: configuration.mountPoint, withIntermediateDirectories: true)
-
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = helperURL
-            process.arguments = configuration.arguments
-            process.standardOutput = pipe
-            process.standardError = pipe
-            process.terminationHandler = { [weak self, weak process] _ in
-                guard let process else { return }
-                Task { @MainActor [weak self] in
-                    self?.didTerminate(process: process)
-                }
-            }
-
-            try process.run()
-            mountProcess = process
-            outputPipe = pipe
-            activeConfiguration = configuration
-
-            try await waitForMount(at: configuration.mountPoint, process: process)
-            guard process.isRunning else {
-                throw MountError.processExited(readProcessOutput())
-            }
-
-            state = .mounted(configuration.mountPoint)
-        } catch {
-            cleanUpAfterFailure()
-            state = stateFor(error: error)
-        }
-    }
-
-    func unmount() async {
-        guard let configuration = activeConfiguration else {
-            state = .waitingForAndroid
-            return
-        }
-
-        state = .mounting
-        requestUnmount(at: configuration.mountPoint)
-        for _ in 0..<20 where isMountPoint(configuration.mountPoint) {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-        }
-
-        if isMountPoint(configuration.mountPoint) {
-            state = .failed("Finder 卷卸载失败，请先关闭正在使用该卷的文件。")
-        } else {
-            clearProcessState()
-            state = .waitingForAndroid
-        }
+    func unmount() {
+        send(.unmountRequested)
     }
 
     func openFinder() {
-        guard case .mounted(let url) = state else { return }
-        NSWorkspace.shared.open(url)
+        guard lifecycle.phase == .mounted else { return }
+        NSWorkspace.shared.open(mountPoint)
     }
 
-    private func bundledHelperURL() -> URL? {
+    /// Unmounts and stops the helper before the app exits. Blocks for a few seconds at most.
+    func shutdown() {
+        retryTimer?.invalidate()
+        retryTimer = nil
+        monitor?.stop()
+        monitor = nil
+        attempt += 1
+        let helper = self.helper
+        self.helper = nil
+        guard helper != nil || MountTable.isMounted(mountPoint) else { return }
+
+        if MountTable.isMounted(mountPoint) {
+            Self.runAndWait("/sbin/umount", [mountPoint.path], timeout: 3)
+        }
+        helper?.terminate()
+        helper?.waitForExit(timeout: 2)
+        if MountTable.isMounted(mountPoint) {
+            Self.runAndWait("/sbin/umount", ["-f", mountPoint.path], timeout: 2)
+        }
+    }
+
+    // MARK: - Events
+
+    private func startMonitoring() {
+        guard monitor == nil else { return }
+        let monitor = USBDeviceMonitor { [weak self] devices in
+            self?.devicesChanged(devices)
+        }
+        self.monitor = monitor
+        monitor.start()
+    }
+
+    private func devicesChanged(_ devices: [MTPDevice]) {
+        self.devices = devices
+        if let activeDevice, !devices.contains(where: { $0.registryID == activeDevice.registryID }) {
+            // The phone this helper serves went away while another one stays attached:
+            // tear down, then mount the remaining phone once the helper has exited.
+            send(.deviceConnectionChanged(false))
+        }
+        send(.deviceConnectionChanged(!devices.isEmpty))
+    }
+
+    private func send(_ event: MountLifecycle.Event) {
+        let commands = lifecycle.handle(event)
+        onStateChange?()
+        for command in commands {
+            perform(command)
+        }
+    }
+
+    private func perform(_ command: MountLifecycle.Command) {
+        switch command {
+        case .startHelper:
+            attempt += 1
+            let attempt = attempt
+            Task { await runHelper(attempt: attempt) }
+        case .unmountVolume:
+            Task { await unmountVolume() }
+        case .stopHelper:
+            stopHelper()
+        case .scheduleRetry(let seconds):
+            scheduleRetry(after: seconds)
+        case .cancelRetry:
+            retryTimer?.invalidate()
+            retryTimer = nil
+        }
+    }
+
+    // MARK: - Commands
+
+    private func runHelper(attempt: Int) async {
+        // A crashed helper - or a previous DroidMount - leaves its mount behind. macFUSE keeps
+        // answering statfs for it, so it looks mounted while every access fails.
+        if MountTable.isMounted(mountPoint) {
+            await Self.run("/sbin/umount", ["-f", mountPoint.path])
+        }
+        guard attempt == self.attempt, lifecycle.phase == .mounting else { return }
+        guard let helperURL = Self.helperURL else {
+            send(.helperExited(.failed("aft-mtp-mount is missing from the app bundle")))
+            return
+        }
+
+        let device = devices.first
+        let configuration = MountConfiguration.make(baseDirectory: baseDirectory, deviceFilter: device?.helperFilter)
+        let helper = HelperProcess(executableURL: helperURL, arguments: configuration.arguments)
+        let helperID = ObjectIdentifier(helper)
+        do {
+            try FileManager.default.createDirectory(at: mountPoint, withIntermediateDirectories: true)
+            try helper.start { [weak self] exit in
+                Task { @MainActor in
+                    self?.helperDidExit(helperID, exit)
+                }
+            }
+        } catch {
+            send(.helperExited(.failed(error.localizedDescription)))
+            return
+        }
+        self.helper = helper
+        activeDevice = device
+
+        let deadline = ContinuousClock.now + Self.mountTimeout
+        while ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(100))
+            guard attempt == self.attempt, self.helper === helper, lifecycle.phase == .mounting else { return }
+            if MountTable.isMounted(mountPoint) {
+                send(.volumeAppeared)
+                return
+            }
+        }
+        helper.stopAfterTimeout()
+    }
+
+    private func helperDidExit(_ helperID: ObjectIdentifier, _ exit: HelperExit) {
+        guard let helper, ObjectIdentifier(helper) == helperID else { return }
+        self.helper = nil
+        activeDevice = nil
+        send(.helperExited(exit))
+        // Whatever the helper left mounted is dead now. Remove it so Finder does not keep a
+        // volume that fails every access; a new attempt clears it on its own.
+        if lifecycle.phase != .mounting, MountTable.isMounted(mountPoint) {
+            Task { await Self.run("/sbin/umount", ["-f", mountPoint.path]) }
+        }
+    }
+
+    private func unmountVolume() async {
+        let status = await Self.run("/sbin/umount", [mountPoint.path])
+        guard lifecycle.phase == .unmounting else { return }
+        guard status == 0 else {
+            send(.unmountRefused)
+            return
+        }
+        guard let helper else {
+            send(.helperExited(.unmounted))
+            return
+        }
+        // The helper's session ends with the volume and it exits by itself; a stuck one must
+        // not keep holding the phone.
+        try? await Task.sleep(for: Self.helperExitGrace)
+        if self.helper === helper {
+            helper.terminate()
+        }
+    }
+
+    private func stopHelper() {
+        attempt += 1
+        if let helper {
+            helper.terminate()
+            return
+        }
+        // The attempt had not launched its helper yet, so no exit will arrive.
+        Task {
+            if MountTable.isMounted(mountPoint) {
+                await Self.run("/sbin/umount", ["-f", mountPoint.path])
+            }
+            send(.helperExited(.unmounted))
+        }
+    }
+
+    private func scheduleRetry(after seconds: Int) {
+        retryTimer?.invalidate()
+        retryTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(seconds), repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.retryTimer = nil
+                self?.send(.retryTimerFired)
+            }
+        }
+    }
+
+    // MARK: - Environment
+
+    private static var helperURL: URL? {
         Bundle.main.url(forResource: "aft-mtp-mount", withExtension: nil, subdirectory: "FinderMount")
     }
 
-    private func unavailableReason() -> String? {
-        guard fileManager.fileExists(atPath: Self.macFUSEFileSystemURL.path),
-              fileManager.fileExists(atPath: Self.macFUSELibraryURL.path) else {
+    private static func checkAvailability() -> String? {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: macFUSEFileSystemURL.path),
+              fileManager.fileExists(atPath: macFUSELibraryURL.path) else {
             return "需要安装并批准 macFUSE。"
         }
-        guard let helperURL = bundledHelperURL(), fileManager.isExecutableFile(atPath: helperURL.path) else {
+        guard let helperURL, fileManager.isExecutableFile(atPath: helperURL.path) else {
             return "DroidMount 未包含挂载助手，请重新构建应用。"
         }
         return nil
     }
 
-    private func waitForMount(at mountPoint: URL, process: Process) async throws {
-        for _ in 0..<150 {
-            guard process.isRunning else {
-                throw MountError.processExited(readProcessOutput())
+    @discardableResult
+    private nonisolated static func run(_ path: String, _ arguments: [String]) async -> Int32 {
+        await withCheckedContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = arguments
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            process.terminationHandler = { process in
+                continuation.resume(returning: process.terminationStatus)
             }
-            if isMountPoint(mountPoint) { return }
-            try await Task.sleep(nanoseconds: 100_000_000)
-        }
-        throw MountError.timedOut
-    }
-
-    private func isMountPoint(_ url: URL) -> Bool {
-        var fileSystem = statfs()
-        let result = url.path.withCString { statfs($0, &fileSystem) }
-        guard result == 0 else { return false }
-        let capacity = MemoryLayout.size(ofValue: fileSystem.f_mntonname)
-        let mountedPath = withUnsafePointer(to: &fileSystem.f_mntonname) { pointer in
-            pointer.withMemoryRebound(to: CChar.self, capacity: capacity) { String(cString: $0) }
-        }
-        return mountedPath == url.path
-    }
-
-    private func requestUnmount(at mountPoint: URL) {
-        if let pendingUnmountProcess, pendingUnmountProcess.isRunning {
-            return
-        }
-
-        let unmount = Process()
-        unmount.executableURL = URL(fileURLWithPath: "/sbin/umount")
-        unmount.arguments = [mountPoint.path]
-        try? unmount.run()
-        pendingUnmountProcess = unmount
-        if let mountProcess, mountProcess.isRunning {
-            mountProcess.terminate()
+            do {
+                try process.run()
+            } catch {
+                process.terminationHandler = nil
+                continuation.resume(returning: -1)
+            }
         }
     }
 
-    private func unmountSynchronously() {
-        guard let configuration = activeConfiguration else { return }
-        requestUnmount(at: configuration.mountPoint)
-        clearProcessState()
-    }
-
-    private func didTerminate(process: Process) {
-        guard mountProcess === process else { return }
-        let output = readProcessOutput()
-        clearProcessState()
-        if state == .mounting || state.isMounted {
-            state = output.isEmpty ? .waitingForAndroid : stateFor(output: output)
+    private nonisolated static func runAndWait(_ path: String, _ arguments: [String], timeout: TimeInterval) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return }
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
         }
     }
-
-    private func cleanUpAfterFailure() {
-        if let mountProcess, mountProcess.isRunning {
-            mountProcess.terminate()
-        }
-        clearProcessState()
-    }
-
-    private func clearProcessState() {
-        mountProcess = nil
-        outputPipe = nil
-        activeConfiguration = nil
-        if let pendingUnmountProcess, !pendingUnmountProcess.isRunning {
-            self.pendingUnmountProcess = nil
-        }
-    }
-
-    private func readProcessOutput() -> String {
-        guard let outputPipe,
-              let data = try? outputPipe.fileHandleForReading.readToEnd(),
-              let output = String(data: data, encoding: .utf8) else { return "" }
-        return String(output.trimmingCharacters(in: .whitespacesAndNewlines).prefix(300))
-    }
-
-    private func stateFor(error: Error) -> MountState {
-        if let error = error as? MountError,
-           case .processExited(let output) = error {
-            return stateFor(output: output)
-        }
-        if let error = error as? MountError,
-           case .timedOut = error {
-            return .failed("等待 Android 挂载超时。请确认手机已解锁并选择“文件传输 / MTP”。")
-        }
-        return .failed(error.localizedDescription)
-    }
-
-    private func stateFor(output: String) -> MountState {
-        let normalized = output.lowercased()
-        if normalized.isEmpty || normalized.contains("no mtp device") || normalized.contains("device not found") {
-            return .waitingForAndroid
-        }
-        return .failed("挂载失败：\(output)")
-    }
-}
-
-private enum MountError: Error {
-    case timedOut
-    case processExited(String)
 }

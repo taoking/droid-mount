@@ -15,88 +15,89 @@ struct DroidMountApplication {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let mountController = MountController()
+    private let menu = NSMenu()
     private var statusItem: NSStatusItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Items are enabled by hand; auto-enabling would turn on every item with a target.
+        menu.autoenablesItems = false
+        menu.delegate = self
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(systemSymbolName: "externaldrive.connected.to.line.below", accessibilityDescription: "DroidMount")
-        item.menu = NSMenu()
-        item.menu?.delegate = self
+        item.menu = menu
         statusItem = item
 
-        mountController.onStateChange = { [weak self] _ in
-            self?.refreshMenu()
+        mountController.onStateChange = { [weak self] in
+            self?.refresh()
         }
-        refreshMenu()
         mountController.start()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        mountController.stop()
+        mountController.shutdown()
     }
 
-    func menuWillOpen(_ menu: NSMenu) {
-        refreshMenu()
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        // macFUSE may have been installed or approved since launch.
+        mountController.refreshAvailability()
+        rebuildMenu()
     }
 
     @objc private func mountNow() {
-        mountController.mountIfNeeded()
+        mountController.mountNow()
     }
 
     @objc private func openFinder() {
         mountController.openFinder()
     }
 
-    @objc private func unmount() {
-        Task { await mountController.unmount() }
+    @objc private func eject() {
+        mountController.unmount()
     }
 
     @objc private func quit() {
         NSApp.terminate(nil)
     }
 
-    private func refreshMenu() {
-        guard let statusItem else { return }
-        statusItem.button?.toolTip = "DroidMount：\(mountController.state.statusText)"
-        statusItem.button?.image = icon(for: mountController.state)
+    private func refresh() {
+        let status = mountController.statusText.replacingOccurrences(of: "\n", with: " ")
+        statusItem?.button?.toolTip = "DroidMount：\(status)"
+        statusItem?.button?.image = NSImage(systemSymbolName: iconName, accessibilityDescription: "DroidMount")
+        rebuildMenu()
+    }
 
-        let menu = NSMenu()
-        let stateItem = menu.addItem(withTitle: mountController.state.statusText, action: nil, keyEquivalent: "")
-        stateItem.isEnabled = false
+    private func rebuildMenu() {
+        menu.removeAllItems()
+        for line in mountController.statusText.split(separator: "\n") {
+            menu.addItem(withTitle: String(line), action: nil, keyEquivalent: "").isEnabled = false
+        }
         menu.addItem(.separator())
 
-        switch mountController.state {
+        switch mountController.lifecycle.phase {
         case .mounted:
             menu.addItem(withTitle: "在 Finder 中显示", action: #selector(openFinder), keyEquivalent: "o")
-            menu.addItem(withTitle: "卸载 Finder", action: #selector(unmount), keyEquivalent: "e")
-        case .mounting:
+            menu.addItem(withTitle: "推出", action: #selector(eject), keyEquivalent: "e")
+        case .mounting, .unmounting:
             break
-        case .waitingForAndroid, .failed, .unavailable:
+        case .idle:
             let item = menu.addItem(withTitle: "立即挂载", action: #selector(mountNow), keyEquivalent: "m")
-            item.isEnabled = !isUnavailable
+            item.isEnabled = mountController.unavailableReason == nil
         }
 
         menu.addItem(.separator())
         menu.addItem(withTitle: "退出 DroidMount", action: #selector(quit), keyEquivalent: "q")
-        menu.items.forEach { $0.target = self }
-        statusItem.menu = menu
-    }
-
-    private var isUnavailable: Bool {
-        if case .unavailable = mountController.state { return true }
-        return false
-    }
-
-    private func icon(for state: MountState) -> NSImage? {
-        let name: String
-        switch state {
-        case .mounted:
-            name = "externaldrive.connected.to.line.below.fill"
-        case .mounting:
-            name = "arrow.triangle.2.circlepath"
-        case .waitingForAndroid, .failed, .unavailable:
-            name = "externaldrive.badge.xmark"
+        for item in menu.items where item.action != nil {
+            item.target = self
         }
-        return NSImage(systemSymbolName: name, accessibilityDescription: "DroidMount")
+    }
+
+    private var iconName: String {
+        switch mountController.lifecycle.phase {
+        case .mounted:
+            return "externaldrive.connected.to.line.below.fill"
+        case .mounting, .unmounting:
+            return "arrow.triangle.2.circlepath"
+        case .idle:
+            return "externaldrive.badge.xmark"
+        }
     }
 }

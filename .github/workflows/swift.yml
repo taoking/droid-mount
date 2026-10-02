@@ -10,3 +10,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: swift test
+
+  patches:
+    # scripts/build_finder_mount.sh applies patches/ to a copy of upstream Android File
+    # Transfer at build time. Catch a patch that no longer applies to upstream here,
+    # before it breaks someone's local build.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply patches to upstream Android File Transfer
+        run: |
+          git clone --depth 1 https://github.com/whoozle/android-file-transfer-linux.git "$RUNNER_TEMP/aft"
+          git -C "$RUNNER_TEMP/aft" log --oneline -1
+          for patch_file in patches/*.patch; do
+            echo "applying $patch_file"
+            patch -p1 -d "$RUNNER_TEMP/aft" --forward --no-backup-if-mismatch < "$patch_file"
+          done

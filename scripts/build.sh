@@ -35,16 +35,27 @@ for tool in swift cmake codesign; do
 done
 
 TRIPLE="$TARGET_ARCH-apple-macosx"
+SWIFT_BUILD_ARGS=(--triple "$TRIPLE")
 if [[ "$BUILD_MODE" == "release" ]]; then
-    swift build -c release --triple "$TRIPLE"
-    SWIFT_BIN="$PROJECT_ROOT/.build/$TRIPLE/release/$APP_NAME"
-else
-    swift build --triple "$TRIPLE"
-    SWIFT_BIN="$PROJECT_ROOT/.build/$TRIPLE/debug/$APP_NAME"
+    SWIFT_BUILD_ARGS+=(-c release)
 fi
+
+swift build "${SWIFT_BUILD_ARGS[@]}"
+
+# Ask SwiftPM where it put the product instead of assuming a layout. The output
+# directory moved when the toolchain switched build systems, and a hardcoded path
+# kept resolving to a leftover binary from the old layout - so the bundle silently
+# shipped a stale build that still passed the executable check below.
+SWIFT_BIN_DIR="$(swift build "${SWIFT_BUILD_ARGS[@]}" --show-bin-path)"
+SWIFT_BIN="$SWIFT_BIN_DIR/$APP_NAME"
 
 if [[ ! -x "$SWIFT_BIN" ]]; then
     echo "ERROR: Swift binary was not produced at $SWIFT_BIN" >&2
+    exit 1
+fi
+
+if [[ "$(lipo -archs "$SWIFT_BIN")" != *"$TARGET_ARCH"* ]]; then
+    echo "ERROR: $SWIFT_BIN is not a $TARGET_ARCH binary (got $(lipo -archs "$SWIFT_BIN"))" >&2
     exit 1
 fi
 
