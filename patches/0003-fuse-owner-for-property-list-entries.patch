@@ -1,0 +1,22 @@
+Report the mounting user as owner of entries listed via GetObjectPropertyList.
+
+GetObjectInfo sets st_uid/st_gid, but it only populates the storage root. Every
+directory below it is filled from GetObjectPropertyList, whose callbacks never
+set them, so those entries reported root:wheel. Linux mounts without
+default_permissions and never notices; macFUSE enforces ownership, so after a
+remount creating, deleting or renaming anything inside an existing subfolder
+(DCIM/Camera, for example) failed with EACCES.
+
+--- a/fuse/fuse.cpp
++++ b/fuse/fuse.cpp
+@@ -291,6 +291,10 @@
+ 						{
+ 							struct stat & attr = _objectAttrs[objectId];
+ 							attr.st_ino = ToFuse(objectId).Inode;
++							//! GetObjectInfo fills these for the storage root; without them every entry
++							//! below it reports root:wheel, and macFUSE refuses writes by the mounting user.
++							attr.st_uid = getuid();
++							attr.st_gid = getgid();
+ 							attr.st_mode = FuseEntry::GetMode(format);
+ 							attr.st_nlink = 1;
+ 						});

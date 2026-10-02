@@ -1,0 +1,217 @@
+Cut MTP round trips: read ahead, cache storage info, trust cached attributes.
+
+Every MTP transaction costs ~1.5 ms of fixed overhead on top of its payload (on
+a Xiaomi 17 Pro over USB 2.0 a 16 KiB read takes 1.8 ms, a 1 MiB read 27-29 ms).
+Copying a photo issued one GetPartialObject per FUSE request, one more
+transaction for open(), and a GetStorageInfo for every statfs() - which Finder,
+the Storage settings pane and copyfile issue constantly.
+
+- Read through a small LRU of read-ahead buffers. The first read of a file and
+  every seek fetch exactly what was asked for; a reader that continues where
+  the previous fetch ended gets up to 8 MiB at once (1 MiB requests from cp and
+  Finder jump straight there, smaller ones double each time). Writes,
+  truncation and unlink drop the buffer for that object.
+- Answer statfs from a 5 second cache of GetStorageInfo.
+- Decide EISDIR in open() from cached attributes instead of asking the device.
+- Append without TruncateObject: Android's SendPartialObject extends the object
+  when it writes at the end, so only a write past the end needs the gap filled.
+
+Measured on a Xiaomi 17 Pro over USB 2.0, interleaving runs of 100 different
+photos each: cp from the volume ran 30.8 / 30.7 / 30.8 MiB/s without this patch
+and 32.7 / 32.5 / 33.5 MiB/s with it, and 60 patterned and whole-file read
+hashes matched. Reading the first 64 KiB of a photo through the page cache
+stays one 1 MiB transaction, ~40 ms either way; a version that fetched 8 MiB
+for any 1 MiB request took ~226 ms for that read.
+
+--- a/fuse/fuse.cpp
++++ b/fuse/fuse.cpp
+@@ -97,6 +97,33 @@
+ 		using ObjectCache = std::list<ObjectCacheEntry>;
+ 		ObjectCache 								_objectCache;
+ 
++		//! One GetPartialObject transaction costs ~1.5 ms on top of its payload, so a reader
++		//! that streams a file gets one large fetch instead of one per FUSE request. A few
++		//! buffers keep interleaved readers (two copies, or a copy and a thumbnail) from
++		//! discarding each other's data.
++		struct ReadAheadEntry
++		{
++			FuseId			Inode;
++			off_t			Offset;
++			mtp::ByteArray	Data;
++		};
++		std::list<ReadAheadEntry>					_readAhead;
++		static constexpr size_t						ReadAheadEntries = 3;
++		static constexpr off_t						ReadAheadMaxSize = 8 * 1024 * 1024;
++		//! A sequential reader asking for this much at a time (cp and Finder read 1 MiB at
++		//! a time) goes straight to the largest fetch; smaller requests double theirs.
++		static constexpr off_t						ReadAheadLargeRequest = 512 * 1024;
++
++		//! Finder, the Storage settings pane and copyfile poll statfs constantly, and each
++		//! call used to cost one GetStorageInfo transaction per storage.
++		struct CachedStorageInfo
++		{
++			mtp::msg::StorageInfo	Info;
++			time_t					Fetched;
++		};
++		std::map<mtp::StorageId, CachedStorageInfo>	_storageInfoCache;
++		static constexpr time_t						StorageInfoTtl = 5;
++
+ 	private:
+ 		static FuseId ToFuse(mtp::ObjectId id)
+ 		{ return FuseId(id.Id + MtpObjectShift); }
+@@ -129,8 +156,60 @@
+ 			if (i == _storageIdList.end())
+ 				throw std::runtime_error("invalid storage id");
+ 			return FuseId(MtpStorageShift + std::distance(_storageIdList.begin(), i));
++		}
++
++		//! The first read of a file and every seek fetch just what was asked for, so reading
++		//! the head of a photo or seeking in a video does not pull in megabytes nobody reads.
++		//! The fetch only grows for a reader that continues where the last one ended.
++		mtp::ByteArray ReadAhead(FuseId inode, mtp::ObjectId objectId, off_t objectSize, off_t begin, off_t size)
++		{
++			off_t fetch = size;
++			auto it = std::find_if(_readAhead.begin(), _readAhead.end(), [inode](const ReadAheadEntry & e) { return e.Inode == inode; });
++			if (it != _readAhead.end())
++			{
++				off_t end = it->Offset + static_cast<off_t>(it->Data.size());
++				if (begin >= it->Offset && begin + size <= end)
++				{
++					auto src = it->Data.data() + (begin - it->Offset);
++					mtp::ByteArray data(src, src + size);
++					_readAhead.splice(_readAhead.begin(), _readAhead, it);
++					return data;
++				}
++				if (begin == end)
++				{
++					if (size >= ReadAheadLargeRequest)
++						fetch = ReadAheadMaxSize;
++					else
++						fetch = 2 * static_cast<off_t>(it->Data.size());
++				}
++				_readAhead.erase(it);
++			}
++			if (fetch > ReadAheadMaxSize)
++				fetch = ReadAheadMaxSize;
++			fetch = std::max<off_t>(size, std::min<off_t>(fetch, objectSize - begin));
++
++			mtp::ByteArray fetched = _session->GetPartialObject(objectId, begin, fetch);
++			mtp::ByteArray data(fetched.begin(), fetched.begin() + std::min<off_t>(size, fetched.size()));
++			_readAhead.push_front(ReadAheadEntry{inode, begin, std::move(fetched)});
++			if (_readAhead.size() > ReadAheadEntries)
++				_readAhead.pop_back();
++			return data;
+ 		}
+ 
++		void DropReadAhead(FuseId inode)
++		{ _readAhead.remove_if([inode](const ReadAheadEntry & e) { return e.Inode == inode; }); }
++
++		mtp::msg::StorageInfo GetCachedStorageInfo(mtp::StorageId storageId)
++		{
++			time_t now = time(NULL);
++			auto it = _storageInfoCache.find(storageId);
++			if (it != _storageInfoCache.end() && now - it->second.Fetched < StorageInfoTtl)
++				return it->second.Info;
++			auto info = _session->GetStorageInfo(storageId);
++			_storageInfoCache[storageId] = CachedStorageInfo{info, now};
++			return info;
++		}
++
+ 		void GetObjectInfo(ChildrenObjects &cache, mtp::ObjectId id)
+ 		{
+ 			auto oi = _session->GetObjectInfo(id);
+@@ -431,6 +510,8 @@
+ 			_files.clear();
+ 			_objectAttrs.clear();
+ 			_directoryCache.clear();
++			_readAhead.clear();
++			_storageInfoCache.clear();
+ 			_session.reset();
+ 			_device.reset();
+ 			_device = mtp::Device::FindFirst(_deviceFilter, _claimInterface, _resetDevice);
+@@ -604,7 +685,7 @@
+ 						--size;
+ 					}
+ 				} else
+-					data = _session->GetPartialObject(objectId, begin, rsize);
++					data = ReadAhead(ino, objectId, attr.st_size, begin, rsize);
+ 			}
+ 			mtp::debug("read ", data.size(), " bytes of data");
+ 			FUSE_CALL(fuse_reply_buf(req, static_cast<char *>(static_cast<void *>(data.data())), data.size()));
+@@ -620,14 +701,18 @@
+ 			ObjectEditSessionPtr tr = GetTransaction(inode);
+ 
+ 			off_t newSize = off + size;
+-			if (newSize > attr.st_size)
++			//! SendPartialObject extends the object when it writes at the end, so only a
++			//! write that starts past the end needs TruncateObject to fill the gap first.
++			if (off > attr.st_size)
+ 			{
+-				mtp::debug("truncating file to ", newSize);
+-				tr->Truncate(newSize);
+-				SetSize(_objectAttrs[objectId], newSize);
++				mtp::debug("extending file to ", off);
++				tr->Truncate(off);
+ 			}
+ 
+ 			tr->Send(off, mtp::ByteArray(buf, buf + size));
++			if (newSize > attr.st_size)
++				SetSize(_objectAttrs[objectId], newSize);
++			DropReadAhead(inode);
+ 			FUSE_CALL(fuse_reply_write(req, size));
+ 		}
+ 
+@@ -643,16 +728,15 @@
+ 		void Open(fuse_req_t req, FuseId ino, struct fuse_file_info *fi)
+ 		{
+ 			mtp::scoped_mutex_lock l(_mutex);
+-			mtp::ObjectFormat format;
+-
++			struct stat attr;
+ 			try
+ 			{
+-				format = static_cast<mtp::ObjectFormat>(_session->GetObjectIntegerProperty(FromFuse(ino), mtp::ObjectProperty::ObjectFormat));
++				attr = GetObjectAttr(ino);
+ 			}
+ 			catch(const std::exception &ex)
+ 			{ FUSE_CALL(fuse_reply_err(req, ENOENT)); return; }
+ 
+-			if (format == mtp::ObjectFormat::Association)
++			if (S_ISDIR(attr.st_mode))
+ 			{
+ 				FUSE_CALL(fuse_reply_err(req, EISDIR));
+ 				return;
+@@ -687,6 +771,7 @@
+ 					tr->Truncate(newSize);
+ 					SetSize(entry.attr, newSize);
+ 					SetSize(_objectAttrs[FromFuse(inode)], newSize);
++					DropReadAhead(inode);
+ 				}
+ 				entry.ReplyAttr();
+ 			}
+@@ -701,6 +786,7 @@
+ 			_session->DeleteObject(id);
+ 			_openedFiles.erase(inode);
+ 			_objectAttrs.erase(id);
++			DropReadAhead(inode);
+ 		}
+ 
+ 		void Unlink(fuse_req_t req, FuseId parent, const char *name)
+@@ -785,7 +871,7 @@
+ 			{
+ 				for(auto storageId : _storageIdList)
+ 				{
+-					mtp::msg::StorageInfo si = _session->GetStorageInfo(storageId);
++					mtp::msg::StorageInfo si = GetCachedStorageInfo(storageId);
+ 					freeSpace += si.FreeSpaceInBytes;
+ 					capacity += si.MaxCapacity;
+ 				}
+@@ -798,7 +884,7 @@
+ 				else
+ 					storageId = _session->GetObjectStorage(FromFuse(ino));
+ 
+-				mtp::msg::StorageInfo si = _session->GetStorageInfo(storageId);
++				mtp::msg::StorageInfo si = GetCachedStorageInfo(storageId);
+ 				freeSpace = si.FreeSpaceInBytes;
+ 				capacity = si.MaxCapacity;
+ 			}

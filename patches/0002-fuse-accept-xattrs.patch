@@ -1,0 +1,57 @@
+Accept and drop extended attributes instead of answering ENOSYS.
+
+aft-mtp-mount implements no xattr callbacks, so macFUSE falls back to storing
+extended attributes as AppleDouble "._" files beside every file Finder copies.
+Under -o noappledouble that fallback is refused with EPERM instead: cp reports
+"could not copy extended attributes" for every file (macOS tags each new file
+with com.apple.provenance), and copyfile aborts quarantined files after creating
+them. On a Xiaomi 17 Pro a 100000-byte file carrying com.apple.quarantine
+arrived on the phone as 0 bytes.
+
+MTP objects cannot hold extended attributes, so accept them and drop them:
+setxattr succeeds, getxattr and removexattr report ENOATTR, listxattr is empty.
+
+--- a/fuse/fuse.cpp
++++ b/fuse/fuse.cpp
+@@ -878,6 +878,30 @@
+ 
+ 	void StatFS(fuse_req_t req, fuse_ino_t ino)
+ 	{ mtp::debug("   StatFS ", ino); WRAP_EX(g_wrapper->StatFS(req, FuseId(ino))); }
++#ifndef ENOATTR
++#	define ENOATTR ENODATA
++#endif
++
++	//! MTP objects cannot carry extended attributes. Answering ENOSYS makes macFUSE fall
++	//! back to AppleDouble "._" files; under -o noappledouble that fallback fails with
++	//! EPERM, and copyfile then gives up on quarantined files after creating them empty.
++	//! Accept the attributes and drop them instead.
++	void SetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value, size_t size, int flags)
++	{ mtp::debug("   SetXAttr ", ino, " ", name); fuse_reply_err(req, 0); }
++
++	void GetXAttr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t size)
++	{ fuse_reply_err(req, ENOATTR); }
++
++	void ListXAttr(fuse_req_t req, fuse_ino_t ino, size_t size)
++	{
++		if (size == 0)
++			fuse_reply_xattr(req, 0);
++		else
++			fuse_reply_buf(req, nullptr, 0);
++	}
++
++	void RemoveXAttr(fuse_req_t req, fuse_ino_t ino, const char *name)
++	{ fuse_reply_err(req, ENOATTR); }
+ }
+ 
+ int main(int argc, char **argv)
+@@ -959,6 +983,10 @@
+ 	ops.rmdir		= &RemoveDir;
+ 	ops.unlink		= &Unlink;
+ 	ops.statfs		= &StatFS;
++	ops.setxattr	= &SetXAttr;
++	ops.getxattr	= &GetXAttr;
++	ops.listxattr	= &ListXAttr;
++	ops.removexattr	= &RemoveXAttr;
+ 
+ 	struct fuse_args fuse_args = FUSE_ARGS_INIT(static_cast<int>(args.size() - 1), args.data());
+ 	struct fuse_cmdline_opts opts = {};

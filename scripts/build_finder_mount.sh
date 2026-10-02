@@ -62,6 +62,16 @@ if [[ -f "$BUILD_DIR/CMakeCache.txt" ]] \
     rm -rf "$BUILD_DIR"
 fi
 
+# rsync -a restores upstream modification times, so a file a dropped patch used to touch
+# comes back older than its object file and make keeps linking the patched code. Start
+# from a clean build directory whenever the patch set changes.
+PATCH_STAMP="$(for patch_file in "${PATCHES[@]}"; do basename "$patch_file"; cat "$patch_file"; done | shasum -a 256 | cut -d' ' -f1)"
+PATCH_STAMP_FILE="$BUILD_DIR/droidmount-patches.sha256"
+if [[ -d "$BUILD_DIR" && "$(cat "$PATCH_STAMP_FILE" 2>/dev/null || true)" != "$PATCH_STAMP" ]]; then
+    echo "patch set changed; discarding build directory" >&2
+    rm -rf "${BUILD_DIR:?}"
+fi
+
 cmake -S "$STAGE_DIR" -B "$BUILD_DIR" -G "Unix Makefiles" \
     -DBUILD_FUSE=ON \
     -DBUILD_QT_UI=OFF \
@@ -72,6 +82,7 @@ cmake -S "$STAGE_DIR" -B "$BUILD_DIR" -G "Unix Makefiles" \
     -DCMAKE_OSX_ARCHITECTURES="$TARGET_ARCH" \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 >&2
 cmake --build "$BUILD_DIR" --target aft-mtp-mount --parallel >&2
+echo "$PATCH_STAMP" > "$PATCH_STAMP_FILE"
 
 HELPER_PATH="$BUILD_DIR/fuse/aft-mtp-mount"
 if [[ ! -x "$HELPER_PATH" ]]; then
