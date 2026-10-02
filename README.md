@@ -8,7 +8,7 @@ DroidMount 是一个菜单栏应用：检测到已解锁、处于“文件传输
 
 在 [Releases](https://github.com/taoking/droid-mount/releases) 下载与 Mac 芯片匹配的 ZIP，解压后将 `DroidMount.app` 拖入“应用程序”文件夹即可。
 
-首次使用前仍必须从 macFUSE 官网安装并批准 macFUSE。当前 `v0.1.2` 为开发者临时签名的 arm64 构建，未使用 Apple Developer ID 公证；若 macOS 阻止打开，请在 Finder 中按住 Control 点按应用并选择“打开”，或在“系统设置 → 隐私与安全性”中确认打开。
+首次使用前仍必须从 macFUSE 官网安装并批准 macFUSE。当前 `v0.2.0` 为开发者临时签名的 arm64 构建，未使用 Apple Developer ID 公证；若 macOS 阻止打开，请在 Finder 中按住 Control 点按应用并选择“打开”，或在“系统设置 → 隐私与安全性”中确认打开。
 
 ## 使用方法
 
@@ -97,7 +97,7 @@ AFTL_USB_BULK_BUFFER_SIZE=65536 ./aft-mtp-mount /path/to/mountpoint
 - 拔下手机后，DroidMount 会结束挂载助手并移除卷，拔线时正在进行的拷贝会失败；重新插入、解锁并选择“文件传输 / MTP”后会自动挂载。
 - 挂载助手意外退出时，DroidMount 会清理遗留的失效挂载，并按上文的间隔自动重新挂载。
 - 应用不提供多设备选择器；连接多台 Android 手机时，只挂载最先检测到的一台。
-- `v0.1.2` 发布包仅支持 Apple Silicon（arm64）Mac。
+- `v0.2.0` 发布包仅支持 Apple Silicon（arm64）Mac。
 
 ## 开发验证
 
